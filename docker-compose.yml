@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  # Nginx Web Server
+  nginx:
+    image: nginx:alpine
+    container_name: case_platform_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - ./backend/public:/var/www/backend/public
+      - ./frontend/dist:/var/www/frontend
+      - ./docker/ssl:/etc/ssl/certs
+    depends_on:
+      - php
+      - websocket
+    networks:
+      - case_platform
+
+  # PHP-FPM Laravel Backend
+  php:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    container_name: case_platform_php
+    volumes:
+      - ./backend:/var/www/backend
+      - ./docker/php/php.ini:/usr/local/etc/php/php.ini
+    environment:
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=case_password
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - case_platform
+
+  # Node.js WebSocket Server
+  websocket:
+    build:
+      context: ./websocket
+      dockerfile: Dockerfile
+    container_name: case_platform_websocket
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./websocket:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=case_password
+    depends_on:
+      - redis
+      - mysql
+    networks:
+      - case_platform
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: case_platform_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: case_platform
+      MYSQL_USER: case_user
+      MYSQL_PASSWORD: case_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - case_platform
+
+  # Redis Cache & Queue
+  redis:
+    image: redis:7-alpine
+    container_name: case_platform_redis
+    command: redis-server --appendonly yes --requirepass redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - case_platform
+
+  # Laravel Horizon (Queue Worker)
+  horizon:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    container_name: case_platform_horizon
+    command: php artisan horizon
+    volumes:
+      - ./backend:/var/www/backend
+    environment:
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=case_password
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - case_platform
+
+  # PhpMyAdmin (Development)
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: case_platform_phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: case_user
+      PMA_PASSWORD: case_password
+    ports:
+      - "8080:80"
+    depends_on:
+      - mysql
+    networks:
+      - case_platform
+    profiles:
+      - dev
+
+  # Frontend Development Server (Vue.js/React)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: case_platform_frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost/api
+      - VITE_WS_URL=http://localhost:3001
+    networks:
+      - case_platform
+    profiles:
+      - dev
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  case_platform:
+    driver: bridge

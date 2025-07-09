@@ -1,0 +1,231 @@
+name: Case Platform CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18'
+  PHP_VERSION: '8.2'
+
+jobs:
+  # Backend Testing
+  backend-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: case_platform_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ env.PHP_VERSION }}
+        extensions: mbstring, dom, fileinfo, mysql, gd, zip, bcmath, intl, redis
+        coverage: xdebug
+
+    - name: Cache Composer packages
+      id: composer-cache
+      uses: actions/cache@v3
+      with:
+        path: backend/vendor
+        key: ${{ runner.os }}-php-${{ hashFiles('backend/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-php-
+
+    - name: Install dependencies
+      working-directory: ./backend
+      run: composer install --prefer-dist --no-progress
+
+    - name: Copy .env
+      working-directory: ./backend
+      run: php -r "file_exists('.env') || copy('.env.ci', '.env');"
+
+    - name: Generate key
+      working-directory: ./backend
+      run: php artisan key:generate
+
+    - name: Directory Permissions
+      working-directory: ./backend
+      run: chmod -R 777 storage bootstrap/cache
+
+    - name: Run migrations
+      working-directory: ./backend
+      env:
+        DB_CONNECTION: mysql
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_DATABASE: case_platform_test
+        DB_USERNAME: root
+        DB_PASSWORD: root
+      run: php artisan migrate
+
+    - name: Execute tests (Unit and Feature tests) via PHPUnit
+      working-directory: ./backend
+      env:
+        DB_CONNECTION: mysql
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        DB_DATABASE: case_platform_test
+        DB_USERNAME: root
+        DB_PASSWORD: root
+      run: vendor/bin/phpunit --coverage-text
+
+    - name: Laravel Pint (Code Style)
+      working-directory: ./backend
+      run: vendor/bin/pint --test
+
+  # Frontend Testing
+  frontend-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./frontend
+      run: npm ci
+
+    - name: Run linter
+      working-directory: ./frontend
+      run: npm run lint
+
+    - name: Type check
+      working-directory: ./frontend
+      run: npm run type-check
+
+    - name: Run tests
+      working-directory: ./frontend
+      run: npm run test:unit
+
+    - name: Build for production
+      working-directory: ./frontend
+      run: npm run build
+
+  # WebSocket Testing
+  websocket-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: websocket/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./websocket
+      run: npm ci
+
+    - name: Run linter
+      working-directory: ./websocket
+      run: npm run lint
+
+    - name: Run tests
+      working-directory: ./websocket
+      run: npm test
+
+  # Build and Deploy
+  deploy:
+    needs: [backend-test, frontend-test, websocket-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ secrets.CONTAINER_REGISTRY }}
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    - name: Build and push Backend image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./docker/php
+        push: true
+        tags: ${{ secrets.CONTAINER_REGISTRY }}/case-platform-backend:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push WebSocket image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./websocket
+        push: true
+        tags: ${{ secrets.CONTAINER_REGISTRY }}/case-platform-websocket:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: |
+        npm ci
+        npm run build
+
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v0.1.10
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        port: ${{ secrets.PORT }}
+        script: |
+          cd /var/www/case-platform
+          docker-compose pull
+          docker-compose up -d --remove-orphans
+          docker-compose exec -T php php artisan migrate --force
+          docker-compose exec -T php php artisan queue:restart
+          docker-compose exec -T php php artisan config:cache
+          docker-compose exec -T php php artisan route:cache
+          docker-compose exec -T php php artisan view:cache
+
+    - name: Slack Notification
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
