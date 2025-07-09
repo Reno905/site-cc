@@ -1,0 +1,319 @@
+version: '3.8'
+
+services:
+  # PHP-FPM Laravel Backend
+  php:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    container_name: case_platform_php_prod
+    restart: unless-stopped
+    volumes:
+      - ./backend:/var/www/backend
+      - ./docker/php/php.prod.ini:/usr/local/etc/php/php.ini
+      - php_logs:/var/log/php
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:8000:9000"
+    healthcheck:
+      test: ["CMD", "php-fpm-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Node.js WebSocket Server
+  websocket:
+    build:
+      context: ./websocket
+      dockerfile: Dockerfile
+    container_name: case_platform_websocket_prod
+    restart: unless-stopped
+    volumes:
+      - ./websocket:/app
+      - websocket_logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=${DB_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "src/health-check.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Frontend Build and Serve
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: case_platform_frontend_prod
+    restart: unless-stopped
+    volumes:
+      - frontend_dist:/app/dist
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:3000:80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: case_platform_mysql_prod
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: case_platform
+      MYSQL_USER: case_user
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - mysql_logs:/var/log/mysql
+      - ./docker/mysql/my.cnf:/etc/mysql/conf.d/custom.cnf
+      - ./docker/mysql/init-prod.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:3306:3306"
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=1000
+      --innodb_buffer_pool_size=1G
+      --innodb_log_file_size=256M
+      --slow_query_log=1
+      --slow_query_log_file=/var/log/mysql/slow.log
+      --long_query_time=2
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "case_user", "-p${DB_PASSWORD}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Redis Cache & Queue
+  redis:
+    image: redis:7-alpine
+    container_name: case_platform_redis_prod
+    restart: unless-stopped
+    command: >
+      redis-server 
+      --appendonly yes 
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+      - redis_logs:/var/log/redis
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Laravel Horizon (Queue Worker)
+  horizon:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    container_name: case_platform_horizon_prod
+    restart: unless-stopped
+    command: php artisan horizon
+    volumes:
+      - ./backend:/var/www/backend
+      - ./docker/php/php.prod.ini:/usr/local/etc/php/php.ini
+      - horizon_logs:/var/log/horizon
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - case_platform
+    healthcheck:
+      test: ["CMD", "php", "artisan", "horizon:status"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Laravel Scheduler
+  scheduler:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    container_name: case_platform_scheduler_prod
+    restart: unless-stopped
+    command: php artisan schedule:work
+    volumes:
+      - ./backend:/var/www/backend
+      - ./docker/php/php.prod.ini:/usr/local/etc/php/php.ini
+      - scheduler_logs:/var/log/scheduler
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_DATABASE=case_platform
+      - DB_USERNAME=case_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - case_platform
+
+  # Nginx Load Balancer (optional for multiple instances)
+  nginx-lb:
+    image: nginx:alpine
+    container_name: case_platform_nginx_lb_prod
+    restart: unless-stopped
+    volumes:
+      - ./docker/nginx/nginx-lb.conf:/etc/nginx/nginx.conf
+      - nginx_logs:/var/log/nginx
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - php
+      - websocket
+      - frontend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - loadbalancer
+
+  # Monitoring and Logging
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: case_platform_portainer_prod
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - case_platform
+    ports:
+      - "127.0.0.1:9000:9000"
+    profiles:
+      - monitoring
+
+  # Log aggregator
+  logspout:
+    image: gliderlabs/logspout:latest
+    container_name: case_platform_logspout_prod
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SYSLOG_FORMAT=rfc3164
+    networks:
+      - case_platform
+    profiles:
+      - monitoring
+
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  frontend_dist:
+    driver: local
+  portainer_data:
+    driver: local
+  
+  # Logs volumes
+  php_logs:
+    driver: local
+  websocket_logs:
+    driver: local
+  mysql_logs:
+    driver: local
+  redis_logs:
+    driver: local
+  horizon_logs:
+    driver: local
+  scheduler_logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+networks:
+  case_platform:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
